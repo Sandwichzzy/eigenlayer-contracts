@@ -179,11 +179,15 @@ contract AllocationManager is
     }
 
     /// @inheritdoc IAllocationManagerActions
+    //   - EigenLayer 新架构中操作员注册到 AVS 的 OperatorSets（操作员集）的主要入口函数
+    //   - 通过 AllocationManager 统一管理
+    //   - 支持 Operator Sets 和惩罚机制
     function registerForOperatorSets(
         address operator,
         RegisterParams calldata params
     ) external onlyWhenNotPaused(PAUSED_OPERATOR_SET_REGISTRATION_AND_DEREGISTRATION) checkCanCall(operator) {
         // Check if the operator has registered.
+        //操作员必须先通过 DelegationManager.registerAsOperator() 完成 EigenLayer 注册
         require(delegation.isOperator(operator), InvalidOperator());
 
         for (uint256 i = 0; i < params.operatorSetIds.length; i++) {
@@ -193,6 +197,10 @@ contract AllocationManager is
             require(!isOperatorSlashable(operator, operatorSet), AlreadyMemberOfSet());
 
             // Add operator to operator set
+            // 添加操作员到 OperatorSet（双向映射）
+            //   OperatorSet.key() 计算：
+            //   keccak256(abi.encodePacked(operatorSet.avs, operatorSet.id));
+
             registeredSets[operator].add(operatorSet.key());
             _operatorSetMembers[operatorSet.key()].add(operator);
             emit OperatorAddedToOperatorSet(operator, operatorSet);
@@ -790,7 +798,8 @@ contract AllocationManager is
         address avs
     ) public view returns (IAVSRegistrar) {
         IAVSRegistrar registrar = _avsRegistrar[avs];
-
+        // 如果 AVS 设置了自定义 Registrar，使用自定义的,AVS 通过 setAVSRegistrar() 设置独立合约
+        // 否则，假设 AVS 地址本身实现了 IAVSRegistrar 接口
         return address(registrar) == address(0) ? IAVSRegistrar(avs) : registrar;
     }
 

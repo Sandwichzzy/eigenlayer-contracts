@@ -63,6 +63,9 @@ contract AVSDirectory is
     ///
 
     /// @inheritdoc IAVSDirectory
+    //   - AVS 发起注册 旧版本
+    //   - 需要操作员预先签名授权
+    //   - 状态存储在 AVSDirectory 中
     function registerOperatorToAVS(
         address operator,
         ISignatureUtilsMixinTypes.SignatureWithSaltAndExpiry memory operatorSignature
