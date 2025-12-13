@@ -75,15 +75,23 @@ contract AllocationManager is
     }
 
     /// @inheritdoc IAllocationManagerActions
+    /// @notice 修改 Operator 对指定 OperatorSet 和 Strategy 的分配(Allocation)
+    /// @dev 这是 Operator 管理其在 AVS 中可惩罚资产量的核心函数
+    /// @param operator 要修改分配的操作员地址
+    /// @param params 分配参数数组，每个参数包含:
+    ///        - operatorSet: 目标 AVS 的 OperatorSet
+    ///        - strategies: 要修改分配的策略列表
+    ///        - newMagnitudes: 对应策略的新幅度值
     function modifyAllocations(
         address operator,
         AllocateParams[] memory params
     ) external onlyWhenNotPaused(PAUSED_MODIFY_ALLOCATIONS) {
-        // Check that the caller is allowed to modify allocations on behalf of the operator
-        // We do not use a modifier to avoid `stack too deep` errors
+        // 权限检查: 验证调用者有权代表 operator 修改分配
+        // 不使用 modifier 是为了避免 "stack too deep" 错误
         _checkCanCall(operator);
 
-        // Check that the operator exists and has configured an allocation delay
+        // 获取并验证 operator 的分配延迟配置
+        // allocationDelay: 增加分配后，新分配的幅度需要等待此延迟后才能被惩罚
         uint32 operatorAllocationDelay;
         {
             (bool isSet, uint32 delay) = getAllocationDelay(operator);
@@ -91,70 +99,98 @@ contract AllocationManager is
             operatorAllocationDelay = delay;
         }
 
+        // 遍历每个 OperatorSet 的分配修改请求
         for (uint256 i = 0; i < params.length; i++) {
+            // 验证策略数组和幅度数组长度匹配
             require(params[i].strategies.length == params[i].newMagnitudes.length, InputArrayLengthMismatch());
 
-            // Check that the operator set exists and get the operator's registration status
-            // Operators do not need to be registered for an operator set in order to allocate
-            // slashable magnitude to the set. In fact, it is expected that operators will
-            // allocate magnitude before registering, as AVS's will likely only accept
-            // registrations from operators that are already slashable.
+            // 验证 OperatorSet 存在
+            // 注意: Operator 不需要已注册到 OperatorSet 就可以分配幅度
+            // 实际场景中，AVS 通常只接受已分配足够可惩罚幅度的 Operator 注册
+            // 因此 Operator 会先调用 modifyAllocations，再调用 registerForOperatorSets
             OperatorSet memory operatorSet = params[i].operatorSet;
             require(_operatorSets[operatorSet.avs].contains(operatorSet.id), InvalidOperatorSet());
 
+            // 检查 operator 是否可被该 OperatorSet 惩罚
+            // 包括两种情况: 1) 已注册 2) 已注销但仍在 DEALLOCATION_DELAY 窗口内
             bool _isOperatorSlashable = isOperatorSlashable(operator, operatorSet);
 
+            // 遍历该 OperatorSet 下的每个策略
             for (uint256 j = 0; j < params[i].strategies.length; j++) {
                 IStrategy strategy = params[i].strategies[j];
 
-                // 1. If the operator has any pending deallocations for this strategy, clear them
-                // to free up magnitude for allocation. Fetch the operator's up to date allocation
-                // info and ensure there is no remaining pending modification.
+                // ============ 步骤 1: 清理待定的取消分配 ============
+                // 如果该策略有任何已到期的取消分配，先完成它们以释放幅度
+                // type(uint16).max 表示清理所有可清理的取消分配
                 _clearDeallocationQueue(operator, strategy, type(uint16).max);
 
+                // 获取最新的分配信息
+                // 如果有待定的修改已到期，_getUpdatedAllocation 会返回应用后的状态
                 (StrategyInfo memory info, Allocation memory allocation) =
                     _getUpdatedAllocation(operator, operatorSet.key(), strategy);
+                // 确保没有其他待定的修改操作
+                // effectBlock == 0 表示没有待定修改
                 require(allocation.effectBlock == 0, ModificationAlreadyPending());
 
-                // 2. Check whether the operator's allocation is slashable. If not, we allow instant
-                // deallocation.
+                // ============ 步骤 2: 检查分配是否可惩罚 ============
+                // 分配可惩罚需要同时满足:
+                // - OperatorSet 包含该 strategy
+                // - Operator 可被该 OperatorSet 惩罚
+                // - 当前已分配的幅度 > 0
                 bool isSlashable = _isAllocationSlashable(operatorSet, strategy, allocation, _isOperatorSlashable);
 
-                // 3. Calculate the change in magnitude
+                // ============ 步骤 3: 计算幅度变化 ============
+                // pendingDiff: 正值表示增加分配，负值表示减少分配(取消分配)
                 allocation.pendingDiff = _calcDelta(allocation.currentMagnitude, params[i].newMagnitudes[j]);
                 require(allocation.pendingDiff != 0, SameMagnitude());
 
-                // 4. Handle deallocation/allocation
+                // ============ 步骤 4: 处理取消分配/分配 ============
                 if (allocation.pendingDiff < 0) {
+                    // --- 场景 A: 取消分配 (减少幅度) ---
                     if (isSlashable) {
-                        // If the operator is slashable, deallocated magnitude will be freed after
-                        // the deallocation delay. This magnitude remains slashable until then.
+                        // A1. 可惩罚的取消分配: 需要延迟生效
+                        // 将取消分配请求加入队列，在 DEALLOCATION_DELAY 期间内仍可被惩罚
                         deallocationQueue[operator][strategy].pushBack(operatorSet.key());
 
-                        // deallocations are slashable in the window [block.number, block.number + deallocationDelay]
-                        // therefore, the effectBlock is set to the block right after the slashable window
+                        // 可惩罚窗口: [block.number, block.number + DEALLOCATION_DELAY]
+                        // effectBlock 设置为窗口结束后的下一个区块
+                        // 例如: 当前区块 100, DEALLOCATION_DELAY = 21 天 (约 50400 区块)
+                        //      effectBlock = 100 + 50400 + 1 = 50501
                         allocation.effectBlock = uint32(block.number) + DEALLOCATION_DELAY + 1;
                     } else {
-                        // Deallocation immediately updates/frees magnitude if the operator is not slashable
+                        // A2. 不可惩罚的取消分配: 立即生效
+                        // 直接减少 encumberedMagnitude (已占用的幅度)
                         info.encumberedMagnitude = _addInt128(info.encumberedMagnitude, allocation.pendingDiff);
 
+                        // 立即更新当前幅度
                         allocation.currentMagnitude = params[i].newMagnitudes[j];
                         allocation.pendingDiff = 0;
                         allocation.effectBlock = uint32(block.number);
                     }
                 } else if (allocation.pendingDiff > 0) {
-                    // Allocation immediately consumes available magnitude, but the additional
-                    // magnitude does not become slashable until after the allocation delay
+                    // --- 场景 B: 增加分配 ---
+                    // 立即占用幅度，但新增的幅度需要等待 allocationDelay 后才能被惩罚
                     info.encumberedMagnitude = _addInt128(info.encumberedMagnitude, allocation.pendingDiff);
+
+                    // 验证没有超过最大可用幅度
+                    // maxMagnitude = operator 该策略下的总可用幅度
+                    // encumberedMagnitude = 已分配到各个 OperatorSet 的幅度总和
                     require(info.encumberedMagnitude <= info.maxMagnitude, InsufficientMagnitude());
 
+                    // 设置生效区块: 当前区块 + operator 配置的分配延迟
+                    // 例如: operatorAllocationDelay = 7200 区块 (约 1 天)
+                    //      effectBlock = block.number + 7200
                     allocation.effectBlock = uint32(block.number) + operatorAllocationDelay;
                 }
 
-                // 5. Update state
+                // ============ 步骤 5: 更新状态 ============
+                // 持久化 allocation、info、encumberedMagnitude
+                // 同时维护 allocatedStrategies 和 allocatedSets 的可枚举集合
                 _updateAllocationInfo(operator, operatorSet.key(), strategy, info, allocation);
 
-                // 6. Emit an event for the updated allocation
+                // ============ 步骤 6: 发出事件 ============
+                // 通知链下索引器分配已更新
+                // 事件参数包含最终的幅度值 (currentMagnitude + pendingDiff)
                 emit AllocationUpdated(
                     operator,
                     operatorSet,
