@@ -98,18 +98,18 @@ uint64 newBalanceGwei = BeaconChainProofs.verifyValidatorBalance({
 
 **执行层**：
 ```solidity
-// ✅ 可以直接读取
+// OK: Can directly read
 uint256 balance = address(this).balance;
 ```
 
 **共识层**：
 ```solidity
-// ❌ 无法直接读取共识层数据
-// uint256 validatorBalance = beacon.getValidatorBalance(index);  // 不存在
+// FAIL: Cannot directly read consensus layer data
+// uint256 validatorBalance = beacon.getValidatorBalance(index);
 
-// ✅ 必须通过 EIP-4788 + Merkle 证明
+// OK: Must use EIP-4788 + Merkle proof
 bytes32 beaconBlockRoot = BEACON_ROOTS_ADDRESS.staticcall(abi.encode(timestamp));
-BeaconChainProofs.verifyValidatorBalance(proof);  // 需要链下生成证明
+BeaconChainProofs.verifyValidatorBalance(proof);
 ```
 
 ### EIP-4788 的作用
@@ -121,11 +121,10 @@ BeaconChainProofs.verifyValidatorBalance(proof);  // 需要链下生成证明
 address internal constant BEACON_ROOTS_ADDRESS = 0x000F3df6D732807Ef1319fB7B8bB8522d0Beac02;
 
 function getParentBlockRoot(uint64 timestamp) public view returns (bytes32) {
-    // 从执行层合约读取共识层的区块根
     (bool success, bytes memory result) =
         BEACON_ROOTS_ADDRESS.staticcall(abi.encode(timestamp));
 
-    return abi.decode(result, (bytes32));  // 返回信标链区块根哈希
+    return abi.decode(result, (bytes32));
 }
 ```
 
@@ -142,11 +141,11 @@ function getParentBlockRoot(uint64 timestamp) public view returns (bytes32) {
 
 ```solidity
 struct Checkpoint {
-    bytes32 beaconBlockRoot;        // 用于验证证明的信标链区块根
-    uint24 proofsRemaining;         // 待提交的证明数量
-    uint64 podBalanceGwei;          // Pod 中待分配的 ETH 余额（执行层）
-    int64 balanceDeltasGwei;        // 验证者余额变化总和（共识层）
-    uint64 prevBeaconBalanceGwei;   // 之前的信标链余额总和
+    bytes32 beaconBlockRoot;        // Beacon block root for proof verification
+    uint24 proofsRemaining;         // Number of proofs pending
+    uint64 podBalanceGwei;          // Pod execution layer balance (gwei)
+    int64 balanceDeltasGwei;        // Sum of validator balance changes
+    uint64 prevBeaconBalanceGwei;   // Previous total beacon balance
 }
 ```
 
@@ -162,16 +161,16 @@ struct Checkpoint {
 
 ```solidity
 struct ValidatorInfo {
-    uint64 validatorIndex;          // 验证者在信标链的索引
-    uint64 restakedBalanceGwei;     // 上次记录的余额
-    uint64 lastCheckpointedAt;      // 最后一次检查点时间戳
-    VALIDATOR_STATUS status;        // 验证者状态
+    uint64 validatorIndex;          // Validator index on beacon chain
+    uint64 restakedBalanceGwei;     // Last recorded balance
+    uint64 lastCheckpointedAt;      // Last checkpoint timestamp
+    VALIDATOR_STATUS status;        // Validator status
 }
 
 enum VALIDATOR_STATUS {
-    INACTIVE,   // 未注册到 Pod
-    ACTIVE,     // 已激活，可参与检查点
-    WITHDRAWN   // 已退出，余额为 0
+    INACTIVE,   // Not registered to Pod
+    ACTIVE,     // Active, can participate in checkpoints
+    WITHDRAWN   // Exited, balance is 0
 }
 ```
 
@@ -179,13 +178,13 @@ enum VALIDATOR_STATUS {
 
 ```solidity
 // EigenPod.sol
-mapping(bytes32 => ValidatorInfo) internal _validatorPubkeyHashToInfo;  // 验证者信息映射
-uint64 public activeValidatorCount;                                     // 活跃验证者数量
-uint64 public currentCheckpointTimestamp;                               // 当前检查点时间戳（0 表示无活跃检查点）
-uint64 public lastCheckpointTimestamp;                                  // 上次完成的检查点时间戳
-uint64 public restakedExecutionLayerGwei;                               // 已计入份额的执行层余额
-Checkpoint internal _currentCheckpoint;                                 // 当前检查点快照
-mapping(uint64 => uint64) public checkpointBalanceExitedGwei;          // 每个检查点中退出验证者的余额
+mapping(bytes32 => ValidatorInfo) internal _validatorPubkeyHashToInfo;
+uint64 public activeValidatorCount;
+uint64 public currentCheckpointTimestamp;  // 0 means no active checkpoint
+uint64 public lastCheckpointTimestamp;
+uint64 public restakedExecutionLayerGwei;
+Checkpoint internal _currentCheckpoint;
+mapping(uint64 => uint64) public checkpointBalanceExitedGwei;
 ```
 
 ---
@@ -207,46 +206,45 @@ function verifyWithdrawalCredentials(
 
 **作用**：首次将信标链验证者注册到 EigenPod，证明其提款凭证指向该 Pod
 
-**执行流程**：
+**执行流程图**：
 
 ```mermaid
 flowchart TD
-    Start([开始]) --> CheckTimestamp{beaconTimestamp<br/>是否有效?}
-    CheckTimestamp -->|❌ 否| Error1[❌ 交易失败<br/>BeaconTimestampTooFarInPast]
-    CheckTimestamp -->|✅ 是| VerifyStateRoot[验证信标链状态根<br/>BeaconChainProofs.verifyStateRoot]
+    Start([Start]) --> CheckTS{Valid timestamp?}
+    CheckTS -->|No| Err1[Error: BeaconTimestampTooFarInPast]
+    CheckTS -->|Yes| VerifySR[Verify state root]
 
-    VerifyStateRoot --> LoopStart[遍历所有验证者]
-    LoopStart --> CheckStatus{验证者状态<br/>== INACTIVE?}
-    CheckStatus -->|❌ 否| Error2[❌ 交易失败<br/>CredentialsAlreadyVerified]
-    CheckStatus -->|✅ 是| CheckActivation{验证者已激活<br/>或激活中?}
+    VerifySR --> Loop[Loop validators]
+    Loop --> ChkStatus{Status == INACTIVE?}
+    ChkStatus -->|No| Err2[Error: CredentialsAlreadyVerified]
+    ChkStatus -->|Yes| ChkAct{Validator activated?}
 
-    CheckActivation -->|❌ 否| Error3[❌ 交易失败<br/>ValidatorInactiveOnBeaconChain]
-    CheckActivation -->|✅ 是| CheckExit{验证者是否<br/>正在退出?}
+    ChkAct -->|No| Err3[Error: ValidatorInactiveOnBeaconChain]
+    ChkAct -->|Yes| ChkExit{Validator exiting?}
 
-    CheckExit -->|✅ 是| Error4[❌ 交易失败<br/>ValidatorIsExitingBeaconChain]
-    CheckExit -->|❌ 否| CheckCredentials{提款凭证<br/>指向本 Pod?}
+    ChkExit -->|Yes| Err4[Error: ValidatorIsExitingBeaconChain]
+    ChkExit -->|No| ChkCreds{Credentials valid?}
 
-    CheckCredentials -->|❌ 否| Error5[❌ 交易失败<br/>WithdrawalCredentialsNotForEigenPod]
-    CheckCredentials -->|✅ 是| VerifyFields[验证验证者字段<br/>BeaconChainProofs.verifyValidatorFields]
+    ChkCreds -->|No| Err5[Error: WithdrawalCredentialsNotForEigenPod]
+    ChkCreds -->|Yes| VerifyF[Verify validator fields]
 
-    VerifyFields --> ReadBalance[读取 effectiveBalance]
-    ReadBalance --> CreateInfo[创建 ValidatorInfo<br/>status = ACTIVE<br/>activeValidatorCount++]
+    VerifyF --> ReadBal[Read effectiveBalance]
+    ReadBal --> Create[Create ValidatorInfo<br/>status = ACTIVE<br/>activeValidatorCount++]
 
-    CreateInfo --> UpdateCheckpoint[更新当前检查点<br/>_currentCheckpoint.prevBeaconBalanceGwei<br/>+= restakedBalanceGwei]
+    Create --> Update[Update checkpoint]
+    Update --> More{More validators?}
+    More -->|Yes| Loop
+    More -->|No| Record[Record balance update<br/>in EigenPodManager]
 
-    UpdateCheckpoint --> MoreValidators{还有更多<br/>验证者?}
-    MoreValidators -->|✅ 是| LoopStart
-    MoreValidators -->|❌ 否| RecordBalance[调用 EigenPodManager<br/>recordBeaconChainETHBalanceUpdate<br/>prevBalance: 0<br/>delta: totalAmountToBeRestakedWei]
-
-    RecordBalance --> End([✅ 完成<br/>验证者已注册<br/>用户份额增加])
+    Record --> End([Complete: Validators registered])
 
     style Start fill:#e1f5e1
     style End fill:#e1f5e1
-    style Error1 fill:#ffe0e0
-    style Error2 fill:#ffe0e0
-    style Error3 fill:#ffe0e0
-    style Error4 fill:#ffe0e0
-    style Error5 fill:#ffe0e0
+    style Err1 fill:#ffe0e0
+    style Err2 fill:#ffe0e0
+    style Err3 fill:#ffe0e0
+    style Err4 fill:#ffe0e0
+    style Err5 fill:#ffe0e0
 ```
 
 **关键代码**：
@@ -254,19 +252,19 @@ flowchart TD
 ```solidity
 // EigenPod.sol:189-236
 function verifyWithdrawalCredentials(...) external {
-    // 1. 时间戳检查（必须晚于当前检查点）
+    // 1. Timestamp checks
     require(beaconTimestamp > currentCheckpointTimestamp,
             BeaconTimestampTooFarInPast());
     require(beaconTimestamp > lastCheckpointTimestamp,
             BeaconTimestampBeforeLatestCheckpoint());
 
-    // 2. 验证信标链状态根
+    // 2. Verify beacon chain state root
     BeaconChainProofs.verifyStateRoot({
         beaconBlockRoot: getParentBlockRoot(beaconTimestamp),
         proof: stateRootProof
     });
 
-    // 3. 遍历验证每个验证者
+    // 3. Verify each validator
     uint256 totalAmountToBeRestakedWei;
     for (uint256 i = 0; i < validatorIndices.length; i++) {
         totalAmountToBeRestakedWei += _verifyWithdrawalCredentials(
@@ -278,10 +276,10 @@ function verifyWithdrawalCredentials(...) external {
         );
     }
 
-    // 4. 通知 EigenPodManager 增加份额
+    // 4. Notify EigenPodManager
     eigenPodManager.recordBeaconChainETHBalanceUpdate({
         podOwner: podOwner,
-        prevRestakedBalanceWei: 0,  // 首次验证，之前余额为 0
+        prevRestakedBalanceWei: 0,
         balanceDeltaWei: int256(totalAmountToBeRestakedWei)
     });
 }
@@ -295,26 +293,26 @@ function _verifyWithdrawalCredentials(...) internal returns (uint256) {
     bytes32 pubkeyHash = validatorFields.getPubkeyHash();
     ValidatorInfo memory validatorInfo = _validatorPubkeyHashToInfo[pubkeyHash];
 
-    // 1. 状态检查
+    // 1. Status check
     require(validatorInfo.status == VALIDATOR_STATUS.INACTIVE,
             CredentialsAlreadyVerified());
 
-    // 2. 验证者必须已激活（或激活中）
+    // 2. Validator must be activated
     require(validatorFields.getActivationEpoch() != FAR_FUTURE_EPOCH,
             ValidatorInactiveOnBeaconChain());
 
-    // 3. 验证者不能正在退出
+    // 3. Validator must not be exiting
     require(validatorFields.getExitEpoch() == FAR_FUTURE_EPOCH,
             ValidatorIsExitingBeaconChain());
 
-    // 4. 验证提款凭证指向本 Pod（支持 0x01 和 0x02 两种类型）
+    // 4. Verify withdrawal credentials (supports 0x01 and 0x02)
     require(
         validatorFields.getWithdrawalCredentials() == bytes32(_podWithdrawalCredentials())
         || validatorFields.getWithdrawalCredentials() == bytes32(_podCompoundingWithdrawalCredentials()),
         WithdrawalCredentialsNotForEigenPod()
     );
 
-    // 5. 验证信标链证明
+    // 5. Verify beacon chain proof
     BeaconChainProofs.verifyValidatorFields({
         proofVersion: _getProofVersion(beaconTimestamp),
         beaconStateRoot: beaconStateRoot,
@@ -323,10 +321,10 @@ function _verifyWithdrawalCredentials(...) internal returns (uint256) {
         validatorIndex: validatorIndex
     });
 
-    // 6. 读取验证者的有效余额
+    // 6. Read effective balance
     uint64 restakedBalanceGwei = validatorFields.getEffectiveBalanceGwei();
 
-    // 7. 创建验证者记录
+    // 7. Create validator record
     activeValidatorCount++;
     uint64 lastCheckpointedAt = currentCheckpointTimestamp == 0
         ? lastCheckpointTimestamp
@@ -339,7 +337,7 @@ function _verifyWithdrawalCredentials(...) internal returns (uint256) {
         status: VALIDATOR_STATUS.ACTIVE
     });
 
-    // 8. 将余额加入当前检查点
+    // 8. Add balance to current checkpoint
     _currentCheckpoint.prevBeaconBalanceGwei += restakedBalanceGwei;
 
     emit ValidatorRestaked(pubkeyHash);
@@ -350,9 +348,9 @@ function _verifyWithdrawalCredentials(...) internal returns (uint256) {
 **关键点**：
 - **首次注册**：将 `INACTIVE` 验证者激活为 `ACTIVE` 状态
 - **双重凭证支持**：支持 0x01（普通提款）和 0x02（复合提款）两种凭证类型
-- **防退出验证者**：拒绝已经开始退出流程的验证者（通过 EIP-4788 的 8192 slot 窗口保证）
-- **立即增加份额**：验证通过后立即调用 `EigenPodManager.recordBeaconChainETHBalanceUpdate` 增加用户份额
-- **使用有效余额**：使用 `effectiveBalance`（每 epoch 更新）而非 `currentBalance`（实时）
+- **防退出验证者**：拒绝已经开始退出流程的验证者
+- **立即增加份额**：验证通过后立即增加用户份额
+- **使用有效余额**：使用 `effectiveBalance`（每 epoch 更新）
 
 ---
 
@@ -367,38 +365,38 @@ function startCheckpoint(
 
 **作用**：创建一个新的 Checkpoint 快照，记录当前时刻的状态
 
-**执行流程**：
+**执行流程图**：
 
 ```mermaid
 flowchart TD
-    Start([开始]) --> CheckActive{是否已有<br/>活跃检查点?}
-    CheckActive -->|✅ 有| Error1[❌ 交易失败<br/>CheckpointAlreadyActive]
-    CheckActive -->|❌ 没有| CheckSameBlock{本区块是否<br/>已完成检查点?}
+    Start([Start]) --> ChkActive{Active checkpoint exists?}
+    ChkActive -->|Yes| Err1[Error: CheckpointAlreadyActive]
+    ChkActive -->|No| ChkBlock{Same block completed?}
 
-    CheckSameBlock -->|✅ 是| Error2[❌ 交易失败<br/>CannotCheckpointTwiceInSingleBlock]
-    CheckSameBlock -->|❌ 否| CalcBalance[计算执行层新增余额<br/>podBalanceGwei = address.balance<br/>- restakedExecutionLayerGwei]
+    ChkBlock -->|Yes| Err2[Error: CannotCheckpointTwiceInSingleBlock]
+    ChkBlock -->|No| Calc[Calculate podBalanceGwei]
 
-    CalcBalance --> CheckZero{podBalanceGwei == 0<br/>且 revertIfNoBalance?}
-    CheckZero -->|✅ 是| Error3[❌ 交易失败<br/>NoBalanceToCheckpoint]
-    CheckZero -->|❌ 否| GetBeaconRoot[获取信标链区块根<br/>beaconBlockRoot =<br/>getParentBlockRoot]
+    Calc --> ChkZero{Balance == 0 AND revertIfNoBalance?}
+    ChkZero -->|Yes| Err3[Error: NoBalanceToCheckpoint]
+    ChkZero -->|No| GetRoot[Get beacon block root]
 
-    GetBeaconRoot --> CreateCheckpoint[创建 Checkpoint 快照<br/>proofsRemaining = activeValidatorCount<br/>podBalanceGwei = 计算值<br/>balanceDeltasGwei = 0<br/>prevBeaconBalanceGwei = 0]
+    GetRoot --> Create[Create Checkpoint<br/>proofsRemaining = activeValidatorCount<br/>podBalanceGwei = calculated<br/>balanceDeltasGwei = 0]
 
-    CreateCheckpoint --> SetTimestamp[设置时间戳<br/>currentCheckpointTimestamp<br/>= block.timestamp]
+    Create --> SetTS[Set currentCheckpointTimestamp]
 
-    SetTimestamp --> CheckProofsRemaining{proofsRemaining == 0?}
-    CheckProofsRemaining -->|✅ 是| AutoComplete[自动完成检查点<br/>没有活跃验证者]
-    CheckProofsRemaining -->|❌ 否| WaitProofs[等待验证者证明提交]
+    SetTS --> ChkProofs{proofsRemaining == 0?}
+    ChkProofs -->|Yes| Auto[Auto-complete checkpoint]
+    ChkProofs -->|No| Wait[Wait for proofs]
 
-    AutoComplete --> End1([✅ 完成<br/>检查点已自动完成])
-    WaitProofs --> End2([✅ 完成<br/>检查点已创建，等待证明])
+    Auto --> End1([Complete: Auto-completed])
+    Wait --> End2([Complete: Waiting for proofs])
 
     style Start fill:#e1f5e1
     style End1 fill:#e1f5e1
     style End2 fill:#fff0e1
-    style Error1 fill:#ffe0e0
-    style Error2 fill:#ffe0e0
-    style Error3 fill:#ffe0e0
+    style Err1 fill:#ffe0e0
+    style Err2 fill:#ffe0e0
+    style Err3 fill:#ffe0e0
 ```
 
 **关键代码**：
@@ -406,30 +404,30 @@ flowchart TD
 ```solidity
 // EigenPod.sol:560-605
 function _startCheckpoint(bool revertIfNoBalance) internal {
-    // 1. 前置检查
+    // 1. Pre-checks
     require(currentCheckpointTimestamp == 0, CheckpointAlreadyActive());
     require(lastCheckpointTimestamp != uint64(block.timestamp),
             CannotCheckpointTwiceInSingleBlock());
 
-    // 2. 计算待分配的 Pod 余额（单位：gwei）
+    // 2. Calculate pod balance (in gwei)
     uint64 podBalanceGwei = uint64(address(this).balance / GWEI_TO_WEI)
                           - restakedExecutionLayerGwei;
 
-    // 3. 如果调用者不想要"0 余额"检查点，则 revert
+    // 3. Revert if no balance and requested
     if (revertIfNoBalance && podBalanceGwei == 0) {
         revert NoBalanceToCheckpoint();
     }
 
-    // 4. 创建 Checkpoint 快照
+    // 4. Create checkpoint snapshot
     Checkpoint memory checkpoint = Checkpoint({
-        beaconBlockRoot: getParentBlockRoot(uint64(block.timestamp)),  // 使用前一个区块根
-        proofsRemaining: uint24(activeValidatorCount),  // 需要证明的活跃验证者数量
+        beaconBlockRoot: getParentBlockRoot(uint64(block.timestamp)),
+        proofsRemaining: uint24(activeValidatorCount),
         podBalanceGwei: podBalanceGwei,
         balanceDeltasGwei: 0,
         prevBeaconBalanceGwei: 0
     });
 
-    // 5. 存储到状态变量
+    // 5. Store to state
     currentCheckpointTimestamp = uint64(block.timestamp);
     _updateCheckpoint(checkpoint);
 
@@ -438,11 +436,11 @@ function _startCheckpoint(bool revertIfNoBalance) internal {
 ```
 
 **关键点**：
-- **快照 Pod 余额**：记录当前 Pod 中未被计入份额的 ETH（执行层余额）
-- **记录活跃验证者数量**：`proofsRemaining` 初始化为活跃验证者数，每提交一个证明减 1
-- **区块根锚定**：使用 `getParentBlockRoot()` 获取前一个区块的信标链根，作为后续证明的基准
-- **自动完成**：如果 `proofsRemaining == 0`（无活跃验证者），检查点立即完成
-- **防止双重检查点**：同一个区块不能完成两次检查点，防止 `lastCheckpointedAt` 冲突
+- **快照 Pod 余额**：记录未被计入份额的执行层 ETH
+- **记录验证者数量**：`proofsRemaining` 初始为活跃验证者数
+- **区块根锚定**：使用前一个区块的信标链根
+- **自动完成**：如果无活跃验证者，检查点立即完成
+- **防止双重检查点**：同一区块不能完成两次检查点
 
 ---
 
@@ -456,62 +454,62 @@ function verifyCheckpointProofs(
 ) external onlyWhenNotPaused(PAUSED_EIGENPODS_VERIFY_CHECKPOINT_PROOFS)
 ```
 
-**作用**：为 Checkpoint 中的验证者提交余额证明，更新其在信标链的余额状态
+**作用**：为 Checkpoint 中的验证者提交余额证明，更新其余额状态
 
-**执行流程**：
+**执行流程图**：
 
 ```mermaid
 flowchart TD
-    Start([开始]) --> CheckActive{是否有<br/>活跃检查点?}
-    CheckActive -->|❌ 否| Error1[❌ 交易失败<br/>NoActiveCheckpoint]
-    CheckActive -->|✅ 是| VerifyContainer[验证 BalanceContainer 证明<br/>BeaconChainProofs.verifyBalanceContainer]
+    Start([Start]) --> ChkActive{Active checkpoint?}
+    ChkActive -->|No| Err1[Error: NoActiveCheckpoint]
+    ChkActive -->|Yes| VerifyCont[Verify balance container]
 
-    VerifyContainer --> LoopStart[遍历所有验证者证明]
-    LoopStart --> GetValidatorInfo[读取 ValidatorInfo]
+    VerifyCont --> Loop[Loop validator proofs]
+    Loop --> GetInfo[Get ValidatorInfo]
 
-    GetValidatorInfo --> CheckStatus{status == ACTIVE?}
-    CheckStatus -->|❌ 否| Skip1[跳过该验证者<br/>continue]
-    CheckStatus -->|✅ 是| CheckTimestamp{lastCheckpointedAt<br/>>= checkpointTimestamp?}
+    GetInfo --> ChkStatus{status == ACTIVE?}
+    ChkStatus -->|No| Skip1[Skip: continue]
+    ChkStatus -->|Yes| ChkTS{lastCheckpointedAt >= timestamp?}
 
-    CheckTimestamp -->|✅ 是| Skip2[跳过该验证者<br/>已在本检查点证明过]
-    CheckTimestamp -->|❌ 否| VerifyBalance[验证余额证明<br/>BeaconChainProofs.verifyValidatorBalance]
+    ChkTS -->|Yes| Skip2[Skip: already proven]
+    ChkTS -->|No| VerifyBal[Verify balance proof]
 
-    VerifyBalance --> CalcDelta[计算余额变化<br/>balanceDeltaGwei =<br/>newBalance - prevBalance]
+    VerifyBal --> CalcDelta[Calculate balance delta]
 
-    CalcDelta --> CheckZeroBalance{newBalance == 0?}
-    CheckZeroBalance -->|✅ 是| MarkWithdrawn[标记为已退出<br/>status = WITHDRAWN<br/>activeValidatorCount--<br/>exitedBalanceGwei += oldBalance]
-    CheckZeroBalance -->|❌ 否| UpdateBalance[更新余额<br/>restakedBalanceGwei = newBalance<br/>lastCheckpointedAt = timestamp]
+    CalcDelta --> ChkZero{newBalance == 0?}
+    ChkZero -->|Yes| MarkWD[Mark WITHDRAWN<br/>activeValidatorCount--]
+    ChkZero -->|No| UpdateBal[Update balance]
 
-    MarkWithdrawn --> Accumulate[累积统计数据<br/>proofsRemaining--<br/>prevBeaconBalanceGwei += prevBalance<br/>balanceDeltasGwei += delta]
-    UpdateBalance --> Accumulate
+    MarkWD --> Accum[Accumulate stats<br/>proofsRemaining--]
+    UpdateBal --> Accum
 
-    Accumulate --> SaveValidator[保存 ValidatorInfo 到 state]
+    Accum --> SaveVal[Save ValidatorInfo]
 
-    SaveValidator --> MoreProofs{还有更多<br/>证明?}
-    MoreProofs -->|✅ 是| LoopStart
-    MoreProofs -->|❌ 否| UpdateExited[更新退出余额<br/>checkpointBalanceExitedGwei<br/>[timestamp] += exitedBalancesGwei]
+    SaveVal --> More{More proofs?}
+    More -->|Yes| Loop
+    More -->|No| UpdateExit[Update exited balance]
 
-    UpdateExited --> UpdateCheckpoint[调用 _updateCheckpoint]
+    UpdateExit --> UpdateCP[Update checkpoint]
 
-    UpdateCheckpoint --> CheckComplete{proofsRemaining == 0?}
-    CheckComplete -->|❌ 否| WaitMore([⏳ 等待更多证明])
-    CheckComplete -->|✅ 是| CalcTotal[计算总变化<br/>prevRestakedBalanceGwei =<br/>restakedExecutionLayerGwei<br/>+ prevBeaconBalanceGwei<br/><br/>balanceDeltaGwei =<br/>podBalanceGwei<br/>+ balanceDeltasGwei]
+    UpdateCP --> ChkComplete{proofsRemaining == 0?}
+    ChkComplete -->|No| WaitMore([Wait for more proofs])
+    ChkComplete -->|Yes| CalcTotal[Calculate total change]
 
-    CalcTotal --> UpdateRestaked[更新执行层余额<br/>restakedExecutionLayerGwei<br/>+= podBalanceGwei]
+    CalcTotal --> UpdateRest[Update restakedExecutionLayerGwei]
 
-    UpdateRestaked --> ClearTimestamp[完成检查点<br/>lastCheckpointTimestamp<br/>= currentCheckpointTimestamp<br/>delete currentCheckpointTimestamp]
+    UpdateRest --> Clear[Complete checkpoint<br/>Clear currentCheckpointTimestamp]
 
-    ClearTimestamp --> RecordBalance[调用 EigenPodManager<br/>recordBeaconChainETHBalanceUpdate<br/>prevBalance: prevRestakedBalanceWei<br/>delta: balanceDeltaWei]
+    Clear --> RecordBal[Record balance in EigenPodManager]
 
-    RecordBalance --> End([✅ 完成<br/>检查点已完成<br/>用户份额已更新])
+    RecordBal --> End([Complete: Checkpoint finalized])
 
-    Skip1 --> MoreProofs
-    Skip2 --> MoreProofs
+    Skip1 --> More
+    Skip2 --> More
 
     style Start fill:#e1f5e1
     style End fill:#e1f5e1
     style WaitMore fill:#fff0e1
-    style Error1 fill:#ffe0e0
+    style Err1 fill:#ffe0e0
 ```
 
 **关键代码**：
@@ -527,24 +525,24 @@ function verifyCheckpointProofs(
 
     Checkpoint memory checkpoint = _currentCheckpoint;
 
-    // 1. 验证余额容器证明（一次性验证）
+    // 1. Verify balance container (one-time)
     BeaconChainProofs.verifyBalanceContainer({
         proofVersion: _getProofVersion(checkpointTimestamp),
         beaconBlockRoot: checkpoint.beaconBlockRoot,
         proof: balanceContainerProof
     });
 
-    // 2. 遍历处理每个验证者的余额证明
+    // 2. Process each validator proof
     uint64 exitedBalancesGwei;
     for (uint256 i = 0; i < proofs.length; i++) {
         BeaconChainProofs.BalanceProof calldata proof = proofs[i];
         ValidatorInfo memory validatorInfo = _validatorPubkeyHashToInfo[proof.pubkeyHash];
 
-        // 跳过非活跃或已证明的验证者
+        // Skip inactive or already-proven validators
         if (validatorInfo.status != VALIDATOR_STATUS.ACTIVE) continue;
         if (validatorInfo.lastCheckpointedAt >= checkpointTimestamp) continue;
 
-        // 3. 验证单个验证者的余额证明
+        // 3. Verify individual validator proof
         (uint64 prevBalanceGwei, int64 balanceDeltaGwei, uint64 exitedBalanceGwei) =
             _verifyCheckpointProof({
                 validatorInfo: validatorInfo,
@@ -553,18 +551,18 @@ function verifyCheckpointProofs(
                 proof: proof
             });
 
-        // 4. 累积统计数据
+        // 4. Accumulate stats
         checkpoint.proofsRemaining--;
         checkpoint.prevBeaconBalanceGwei += prevBalanceGwei;
         checkpoint.balanceDeltasGwei += balanceDeltaGwei;
         exitedBalancesGwei += exitedBalanceGwei;
 
-        // 5. 更新验证者状态
+        // 5. Update validator state
         _validatorPubkeyHashToInfo[proof.pubkeyHash] = validatorInfo;
         emit ValidatorCheckpointed(checkpointTimestamp, proof.pubkeyHash);
     }
 
-    // 6. 更新 Checkpoint（如果 proofsRemaining == 0 则自动完成）
+    // 6. Update checkpoint (auto-completes if proofsRemaining == 0)
     checkpointBalanceExitedGwei[checkpointTimestamp] += exitedBalancesGwei;
     _updateCheckpoint(checkpoint);
 }
@@ -579,27 +577,27 @@ function _verifyCheckpointProof(...) internal returns (
     int64 balanceDeltaGwei,
     uint64 exitedBalanceGwei
 ) {
-    // 1. 获取旧余额
+    // 1. Get old balance
     prevBalanceGwei = validatorInfo.restakedBalanceGwei;
 
-    // 2. 从信标链证明中读取新余额
+    // 2. Read new balance from beacon chain proof
     uint64 newBalanceGwei = BeaconChainProofs.verifyValidatorBalance({
         balanceContainerRoot: balanceContainerRoot,
         validatorIndex: uint40(validatorInfo.validatorIndex),
         proof: proof
     });
 
-    // 3. 计算余额变化
+    // 3. Calculate balance change
     if (newBalanceGwei != prevBalanceGwei) {
         balanceDeltaGwei = int64(newBalanceGwei) - int64(prevBalanceGwei);
         emit ValidatorBalanceUpdated(proof.pubkeyHash, checkpointTimestamp, newBalanceGwei);
     }
 
-    // 4. 更新验证者信息
+    // 4. Update validator info
     validatorInfo.restakedBalanceGwei = newBalanceGwei;
     validatorInfo.lastCheckpointedAt = checkpointTimestamp;
 
-    // 5. 如果余额为 0，标记为已退出
+    // 5. Mark as withdrawn if balance is 0
     if (newBalanceGwei == 0) {
         activeValidatorCount--;
         validatorInfo.status = VALIDATOR_STATUS.WITHDRAWN;
@@ -618,23 +616,23 @@ function _verifyCheckpointProof(...) internal returns (
 function _updateCheckpoint(Checkpoint memory checkpoint) internal {
     _currentCheckpoint = checkpoint;
 
-    // 如果还有待提交的证明，直接返回
+    // If proofs remaining, return early
     if (checkpoint.proofsRemaining != 0) {
         return;
     }
 
-    // 计算之前的总余额和变化量
+    // Calculate previous total and change
     uint64 prevRestakedBalanceGwei = restakedExecutionLayerGwei + checkpoint.prevBeaconBalanceGwei;
     int64 balanceDeltaGwei = int64(checkpoint.podBalanceGwei) + checkpoint.balanceDeltasGwei;
 
-    // 将执行层余额标记为"已计入份额"
+    // Mark execution layer balance as "included in shares"
     restakedExecutionLayerGwei += checkpoint.podBalanceGwei;
 
-    // 完成检查点
+    // Complete checkpoint
     lastCheckpointTimestamp = currentCheckpointTimestamp;
     delete currentCheckpointTimestamp;
 
-    // 转换为 wei 并通知 EigenPodManager
+    // Convert to wei and notify EigenPodManager
     uint256 prevRestakedBalanceWei = prevRestakedBalanceGwei * GWEI_TO_WEI;
     int256 balanceDeltaWei = balanceDeltaGwei * int256(GWEI_TO_WEI);
 
@@ -648,11 +646,11 @@ function _updateCheckpoint(Checkpoint memory checkpoint) internal {
 ```
 
 **关键点**：
-- **批量验证**：可以一次提交多个验证者的证明（gas 优化）
-- **余额对账**：比较上次检查点的余额与当前信标链余额，计算 delta
-- **自动退出检测**：余额为 0 的验证者自动标记为 `WITHDRAWN` 状态
-- **防重复验证**：通过 `lastCheckpointedAt` 防止同一验证者在同一检查点被重复证明
-- **跳过而非 revert**：使用 `continue` 跳过无效验证者，避免单个无效证明导致整个交易失败
+- **批量验证**：可一次提交多个验证者证明（gas 优化）
+- **余额对账**：比较上次与当前余额，计算 delta
+- **自动退出检测**：余额为 0 自动标记为 `WITHDRAWN`
+- **防重复验证**：通过 `lastCheckpointedAt` 防止重复
+- **跳过而非 revert**：使用 `continue` 跳过无效验证者
 
 ---
 
@@ -670,33 +668,33 @@ function _updateCheckpoint(Checkpoint memory checkpoint) internal {
 
 ### 数据追踪表
 
-| 时间点 | 事件 | Validator A<br/>(共识层) | Validator B<br/>(共识层) | Pod Balance<br/>(执行层) | restaked<br/>Execution<br/>LayerGwei | active<br/>Validator<br/>Count | Alice<br/>份额 | 变化说明 |
-|--------|------|----------|----------|----------|----------|----------|--------|---------|
-| **Day 0** | 🔷 质押 | 32 ETH | 32 ETH | 0 | 0 | 0 | **0** | 初始质押到信标链 |
-| **Day 1** | 🔷 验证凭证 | 32 ETH<br/>✅ ACTIVE | 32 ETH<br/>✅ ACTIVE | 0 | 0 | 2 | **64 ETH** | 首次注册,立即获得份额 |
-| **Day 180** | 📊 奖励累积 | 33.2 ETH<br/>(+1.2) | 33.5 ETH<br/>(+1.5) | 1.8 ETH | 0 | 2 | 64 ETH | ⚠️ 份额未同步 |
-| **Day 180** | 🔷 完成检查点 | 33.2 ETH | 33.5 ETH | 1.8 ETH | **1.8 ETH** | 2 | **68.5 ETH** | +4.5 ETH (1.8执行+2.7共识) |
-| **Day 200** | ⚠️ B 被罚没 | 33.8 ETH<br/>(+0.6) | 31.8 ETH<br/>🚨 SLASHED<br/>(-1.7) | 1.8 ETH | 1.8 ETH | 2 | **67.4 ETH** | -1.1 ETH 罚没损失 |
-| **Day 260** | 🚪 B 退出到 Pod | 34.2 ETH | 0 ETH<br/>⏳ 退出中 | **33.6 ETH** | 1.8 ETH | 2 | 67.4 ETH | 31.8 ETH 转入 Pod |
-| **Day 261** | 🔷 更新退出状态 | 34.2 ETH | 0 ETH<br/>🚫 WITHDRAWN | 33.6 ETH | **33.6 ETH** | **1** | **67.8 ETH** | +0.4 ETH (仅 A 增长) |
-| **Day 269** | 💰 提款完成 | 34.2 ETH | 0 ETH | **3.6 ETH** | **3.6 ETH** | 1 | **37.8 ETH** | Alice 提走 30 ETH |
+| Time | Event | Validator A (Consensus) | Validator B (Consensus) | Pod Balance (Execution) | restakedExecutionLayerGwei | activeValidatorCount | Alice Shares | Notes |
+|------|-------|----------|----------|----------|----------|----------|--------|---------|
+| **Day 0** | Stake | 32 ETH | 32 ETH | 0 | 0 | 0 | **0** | Initial stake to beacon chain |
+| **Day 1** | Verify credentials | 32 ETH ✅ ACTIVE | 32 ETH ✅ ACTIVE | 0 | 0 | 2 | **64 ETH** | First registration, immediate shares |
+| **Day 180** | Rewards accumulated | 33.2 ETH (+1.2) | 33.5 ETH (+1.5) | 1.8 ETH | 0 | 2 | 64 ETH | ⚠️ Shares not synced |
+| **Day 180** | Checkpoint completed | 33.2 ETH | 33.5 ETH | 1.8 ETH | **1.8 ETH** | 2 | **68.5 ETH** | +4.5 ETH (1.8 exec + 2.7 consensus) |
+| **Day 200** | B slashed | 33.8 ETH (+0.6) | 31.8 ETH 🚨 SLASHED (-1.7) | 1.8 ETH | 1.8 ETH | 2 | **67.4 ETH** | -1.1 ETH slashing penalty |
+| **Day 260** | B exits to Pod | 34.2 ETH | 0 ETH ⏳ Exiting | **33.6 ETH** | 1.8 ETH | 2 | 67.4 ETH | 31.8 ETH transferred to Pod |
+| **Day 261** | Update exit status | 34.2 ETH | 0 ETH 🚫 WITHDRAWN | 33.6 ETH | **33.6 ETH** | **1** | **67.8 ETH** | +0.4 ETH (only A growth) |
+| **Day 269** | Withdrawal completed | 34.2 ETH | 0 ETH | **3.6 ETH** | **3.6 ETH** | 1 | **37.8 ETH** | Alice withdrew 30 ETH |
 
 ### 关键时刻详解
 
-#### 阶段 2: verifyWithdrawalCredentials (Day 1)
+#### Phase 2: verifyWithdrawalCredentials (Day 1)
 
 ```solidity
-// Alice 调用
+// Alice calls
 pod.verifyWithdrawalCredentials(
     beaconTimestamp: Day 1,
-    validatorIndices: [1234, 5678],  // A 和 B 的索引
+    validatorIndices: [1234, 5678],  // A and B indices
     validatorFields: [
-        [32 ETH, 0x01...Pod地址, ...],  // A 的字段
-        [32 ETH, 0x01...Pod地址, ...]   // B 的字段
+        [32 ETH, 0x01...PodAddress, ...],  // A fields
+        [32 ETH, 0x01...PodAddress, ...]   // B fields
     ]
 );
 
-// 内部执行
+// Internal execution
 for (uint i = 0; i < 2; i++) {
     uint64 restakedBalanceGwei = validatorFields[i].getEffectiveBalanceGwei();  // 32 ETH
 
@@ -704,43 +702,43 @@ for (uint i = 0; i < 2; i++) {
         validatorIndex: validatorIndices[i],
         restakedBalanceGwei: 32 * 1e9,  // 32 ETH in gwei
         lastCheckpointedAt: 0,
-        status: VALIDATOR_STATUS.ACTIVE  // ✅ 激活
+        status: VALIDATOR_STATUS.ACTIVE  // Activated
     });
 
-    activeValidatorCount++;  // 0 → 1 → 2
+    activeValidatorCount++;  // 0 -> 1 -> 2
     totalAmountToBeRestakedWei += 32 ether;
 }
 
-// 通知 EigenPodManager
+// Notify EigenPodManager
 eigenPodManager.recordBeaconChainETHBalanceUpdate(
     podOwner: Alice,
     prevRestakedBalanceWei: 0,
-    balanceDeltaWei: +64 ether  // 立即增加 64 ETH 份额
+    balanceDeltaWei: +64 ether  // Immediate 64 ETH shares
 );
 ```
 
-**结果**：
+**Result**:
 - ✅ activeValidatorCount: 0 → 2
-- ✅ Alice 份额: 0 → 64 ETH
-- ✅ 验证者状态: INACTIVE → ACTIVE
+- ✅ Alice shares: 0 → 64 ETH
+- ✅ Validator status: INACTIVE → ACTIVE
 
-#### 阶段 4: startCheckpoint (Day 180)
+#### Phase 4: startCheckpoint (Day 180)
 
 ```solidity
-// Day 180 时刻
-// Pod 余额: 1.8 ETH (执行层奖励)
-// restakedExecutionLayerGwei: 0 (还未计入份额)
+// Day 180 snapshot
+// Pod balance: 1.8 ETH (execution layer rewards)
+// restakedExecutionLayerGwei: 0 (not yet included in shares)
 
 pod.startCheckpoint(false);
 
-// 内部执行
+// Internal execution
 uint64 podBalanceGwei = uint64(address(this).balance / GWEI_TO_WEI)
                       - restakedExecutionLayerGwei;
 // = uint64(1.8 ether / 1e9) - 0
 // = 1800000000 gwei (1.8 ETH)
 
 Checkpoint memory checkpoint = Checkpoint({
-    beaconBlockRoot: 0xabc123...,  // 通过 EIP-4788 读取
+    beaconBlockRoot: 0xabc123...,  // Read via EIP-4788
     proofsRemaining: 2,  // activeValidatorCount
     podBalanceGwei: 1800000000,  // 1.8 ETH
     balanceDeltasGwei: 0,
@@ -750,22 +748,22 @@ Checkpoint memory checkpoint = Checkpoint({
 currentCheckpointTimestamp = block.timestamp;  // Day 180
 ```
 
-**结果**：
-- ✅ 检查点已创建
-- ✅ 锁定 Pod 余额: 1.8 ETH
-- ✅ 等待 2 个验证者证明
+**Result**:
+- ✅ Checkpoint created
+- ✅ Locked Pod balance: 1.8 ETH
+- ✅ Waiting for 2 validator proofs
 
-#### 阶段 5: verifyCheckpointProofs (Day 180)
+#### Phase 5: verifyCheckpointProofs (Day 180)
 
 ```solidity
 pod.verifyCheckpointProofs(
-    balanceContainerProof: {...},  // 容器证明（一次性）
-    proofs: [proofA, proofB]       // 每个验证者的证明
+    balanceContainerProof: {...},  // Container proof (one-time)
+    proofs: [proofA, proofB]       // Each validator proof
 );
 
-// 处理 Validator A
+// Process Validator A
 ValidatorInfo memory infoA = _validatorPubkeyHashToInfo[hashA];
-// infoA.restakedBalanceGwei = 32 * 1e9 (上次的余额)
+// infoA.restakedBalanceGwei = 32 * 1e9 (previous balance)
 
 uint64 newBalanceA = BeaconChainProofs.verifyValidatorBalance(...);
 // = 33.2 * 1e9 gwei
@@ -773,22 +771,22 @@ uint64 newBalanceA = BeaconChainProofs.verifyValidatorBalance(...);
 int64 deltaA = int64(newBalanceA) - int64(infoA.restakedBalanceGwei);
 // = int64(33.2e9) - int64(32e9) = +1.2e9 gwei (+1.2 ETH)
 
-checkpoint.prevBeaconBalanceGwei += 32e9;  // 0 → 32e9
-checkpoint.balanceDeltasGwei += deltaA;    // 0 → +1.2e9
-checkpoint.proofsRemaining--;               // 2 → 1
+checkpoint.prevBeaconBalanceGwei += 32e9;  // 0 -> 32e9
+checkpoint.balanceDeltasGwei += deltaA;    // 0 -> +1.2e9
+checkpoint.proofsRemaining--;               // 2 -> 1
 
-// 处理 Validator B
+// Process Validator B
 uint64 newBalanceB = 33.5 * 1e9;
 int64 deltaB = +1.5e9;  // +1.5 ETH
 
-checkpoint.prevBeaconBalanceGwei += 32e9;  // 32e9 → 64e9
-checkpoint.balanceDeltasGwei += deltaB;    // +1.2e9 → +2.7e9
-checkpoint.proofsRemaining--;               // 1 → 0
+checkpoint.prevBeaconBalanceGwei += 32e9;  // 32e9 -> 64e9
+checkpoint.balanceDeltasGwei += deltaB;    // +1.2e9 -> +2.7e9
+checkpoint.proofsRemaining--;               // 1 -> 0
 
-// ✅ proofsRemaining == 0，自动完成检查点
+// Auto-complete checkpoint when proofsRemaining == 0
 _updateCheckpoint(checkpoint);
 
-// 计算总变化
+// Calculate total change
 uint64 prevRestakedBalanceGwei = restakedExecutionLayerGwei + checkpoint.prevBeaconBalanceGwei;
 // = 0 + 64e9 = 64e9 gwei (64 ETH)
 
@@ -796,32 +794,32 @@ int64 balanceDeltaGwei = int64(checkpoint.podBalanceGwei) + checkpoint.balanceDe
 // = int64(1.8e9) + 2.7e9 = 4.5e9 gwei (+4.5 ETH)
 
 restakedExecutionLayerGwei += checkpoint.podBalanceGwei;
-// = 0 + 1.8e9 = 1.8e9 (将执行层余额标记为"已计入份额")
+// = 0 + 1.8e9 = 1.8e9 (mark execution layer balance as "included in shares")
 
 eigenPodManager.recordBeaconChainETHBalanceUpdate(
     podOwner: Alice,
     prevRestakedBalanceWei: 64 ether,
-    balanceDeltaWei: +4.5 ether  // Alice 份额: 64 → 68.5 ETH
+    balanceDeltaWei: +4.5 ether  // Alice shares: 64 -> 68.5 ETH
 );
 ```
 
-**结果**：
-- ✅ 检查点已完成
+**Result**:
+- ✅ Checkpoint completed
 - ✅ restakedExecutionLayerGwei: 0 → 1.8 ETH
-- ✅ Alice 份额: 64 → 68.5 ETH
-- ✅ Validator A 余额更新: 32 → 33.2 ETH
-- ✅ Validator B 余额更新: 32 → 33.5 ETH
+- ✅ Alice shares: 64 → 68.5 ETH
+- ✅ Validator A balance updated: 32 → 33.2 ETH
+- ✅ Validator B balance updated: 32 → 33.5 ETH
 
-#### 阶段 9: 处理退出验证者 (Day 261)
+#### Phase 9: Handle Exited Validator (Day 261)
 
 ```solidity
 // Day 261
-// Pod 余额: 33.6 ETH (1.8 旧 + 31.8 退出转入)
+// Pod balance: 33.6 ETH (1.8 old + 31.8 from exit)
 // restakedExecutionLayerGwei: 1.8e9
 
 pod.startCheckpoint(false);
 uint64 podBalanceGwei = uint64(33.6 ether / 1e9) - 1.8e9 = 31.8e9;
-// ↑ 新增的 31.8 ETH (B 退出的资金)
+// New 31.8 ETH (B exit funds)
 
 pod.verifyCheckpointProofs([proofA, proofB]);
 
@@ -830,27 +828,27 @@ uint64 newBalanceA = 34.2e9;  // +0.4 ETH
 int64 deltaA = +0.4e9;
 
 // Validator B
-uint64 newBalanceB = 0;  // 已退出
+uint64 newBalanceB = 0;  // Exited
 int64 deltaB = int64(0) - int64(31.8e9) = -31.8e9;  // -31.8 ETH
 
 if (newBalanceB == 0) {
-    activeValidatorCount--;  // 2 → 1
-    validatorInfo[B].status = VALIDATOR_STATUS.WITHDRAWN;  // 标记为已退出
+    activeValidatorCount--;  // 2 -> 1
+    validatorInfo[B].status = VALIDATOR_STATUS.WITHDRAWN;  // Mark as withdrawn
     exitedBalanceGwei = uint64(-deltaB) = 31.8e9;
 }
 
-// 总变化计算
+// Total change calculation
 int64 totalDelta = int64(31.8e9) + 0.4e9 - 31.8e9 = +0.4e9;
-// ↑ 执行层新增    ↑ A增长  ↑ B退出抵消
+// Exec layer new + A growth - B exit offset
 
-// Alice 份额: 67.4 → 67.8 ETH (仅增加 A 的 0.4 ETH)
+// Alice shares: 67.4 -> 67.8 ETH (only A growth +0.4 ETH)
 ```
 
-**结果**：
-- ✅ Validator B 标记为 WITHDRAWN
+**Result**:
+- ✅ Validator B marked WITHDRAWN
 - ✅ activeValidatorCount: 2 → 1
 - ✅ restakedExecutionLayerGwei: 1.8 → 33.6 ETH
-- ✅ Alice 份额: 67.4 → 67.8 ETH
+- ✅ Alice shares: 67.4 → 67.8 ETH
 
 ---
 
@@ -862,52 +860,33 @@ int64 totalDelta = int64(31.8e9) + 0.4e9 - 31.8e9 = +0.4e9;
 stateDiagram-v2
     direction LR
 
-    [*] --> INACTIVE: 验证者未注册到 Pod
+    [*] --> INACTIVE: Not registered
 
-    INACTIVE --> ACTIVE: verifyWithdrawalCredentials()<br/>✅ 验证提款凭证<br/>✅ 检查 activation_epoch<br/>✅ 检查 exit_epoch
+    INACTIVE --> ACTIVE: verifyWithdrawalCredentials()
 
     state ACTIVE {
-        [*] --> 正常工作
-        正常工作 --> 余额增长: 共识层奖励累积
-        余额增长 --> 正常工作: verifyCheckpointProofs()<br/>更新余额
-        正常工作 --> 被罚没: verifyStaleBalance()<br/>检测到 slashed=true
-        被罚没 --> 余额减少: 罚没惩罚生效
-        余额减少 --> 正常工作: verifyCheckpointProofs()<br/>更新罚没后余额
+        [*] --> Working
+        Working --> Rewards: Consensus rewards
+        Rewards --> Working: verifyCheckpointProofs()
+        Working --> Slashed: verifyStaleBalance()
+        Slashed --> Penalized: Slashing penalty
+        Penalized --> Working: verifyCheckpointProofs()
     }
 
-    ACTIVE --> WITHDRAWN: verifyCheckpointProofs()<br/>检测到 balance=0<br/>activeValidatorCount--
+    ACTIVE --> WITHDRAWN: verifyCheckpointProofs()<br/>balance=0
 
     state WITHDRAWN {
-        [*] --> 已退出
-        note right of 已退出
-            验证者不再参与共识
-            ETH 已转入 Pod 执行层
-            不再计入 activeValidatorCount
-        end note
+        [*] --> Exited
     }
 
-    WITHDRAWN --> [*]: 生命周期结束
-
-    note right of INACTIVE
-        status = VALIDATOR_STATUS.INACTIVE
-        restakedBalanceGwei = 0
-        lastCheckpointedAt = 0
-    end note
-
-    note right of ACTIVE
-        status = VALIDATOR_STATUS.ACTIVE
-        restakedBalanceGwei > 0
-        lastCheckpointedAt = 最后检查点时间
-        计入 activeValidatorCount
-    end note
-
-    note right of WITHDRAWN
-        status = VALIDATOR_STATUS.WITHDRAWN
-        restakedBalanceGwei = 0
-        lastCheckpointedAt = 退出时检查点时间
-        不计入 activeValidatorCount
-    end note
+    WITHDRAWN --> [*]: Lifecycle end
 ```
+
+**状态说明**：
+
+- **INACTIVE**: 验证者未注册到 Pod，`restakedBalanceGwei = 0`
+- **ACTIVE**: 验证者已激活，`restakedBalanceGwei > 0`，计入 `activeValidatorCount`
+- **WITHDRAWN**: 验证者已退出，`restakedBalanceGwei = 0`，不计入 `activeValidatorCount`
 
 ### Checkpoint 生命周期
 
@@ -915,32 +894,30 @@ stateDiagram-v2
 stateDiagram-v2
     direction LR
 
-    [*] --> 无活跃检查点: currentCheckpointTimestamp == 0
+    [*] --> NoCheckpoint: currentCheckpointTimestamp == 0
 
-    无活跃检查点 --> 检查点已创建: startCheckpoint()<br/>创建快照<br/>currentCheckpointTimestamp = now
+    NoCheckpoint --> Active: startCheckpoint()
 
-    state 检查点已创建 {
-        [*] --> 等待证明
-        等待证明: proofsRemaining > 0
-        等待证明: 等待用户提交验证者证明
-
-        等待证明 --> 证明进行中: verifyCheckpointProofs()<br/>提交部分证明
-        证明进行中: proofsRemaining 逐渐减少
-        证明进行中 --> 等待证明: 还有待提交的证明
-        证明进行中 --> 检查点完成: proofsRemaining == 0
+    state Active {
+        [*] --> WaitingProofs
+        WaitingProofs: proofsRemaining > 0
+        WaitingProofs --> Processing: verifyCheckpointProofs()
+        Processing: proofsRemaining decreasing
+        Processing --> WaitingProofs: Still pending
+        Processing --> Completed: proofsRemaining == 0
     }
 
-    检查点已创建 --> 无活跃检查点: 检查点完成<br/>lastCheckpointTimestamp = current<br/>currentCheckpointTimestamp = 0<br/>更新用户份额
+    Active --> NoCheckpoint: Completed<br/>Update shares
 
-    note right of 无活跃检查点
-        可以启动新检查点
-        验证者余额未被锁定
+    note right of NoCheckpoint
+        Can start new checkpoint
+        Validator balances not locked
     end note
 
-    note right of 检查点已创建
-        检查点状态已锁定
-        beaconBlockRoot 已固定
-        必须完成才能启动新检查点
+    note right of Active
+        Checkpoint state locked
+        beaconBlockRoot fixed
+        Must complete before new checkpoint
     end note
 ```
 
@@ -950,154 +927,154 @@ stateDiagram-v2
 
 ### 1. 两阶段余额更新
 
-| 阶段 | 函数 | 余额来源 | 精度 | 时机 |
-|------|------|---------|------|------|
-| **首次注册** | verifyWithdrawalCredentials | effectiveBalance | 粗略（epoch 级别） | 验证者激活后 |
-| **定期更新** | verifyCheckpointProofs | currentBalance | 精确（slot 级别） | 完整检查点 |
+| Phase | Function | Balance Source | Precision | Timing |
+|-------|----------|---------------|-----------|--------|
+| **Initial Registration** | verifyWithdrawalCredentials | effectiveBalance | Coarse (epoch-level) | After validator activation |
+| **Periodic Update** | verifyCheckpointProofs | currentBalance | Precise (slot-level) | Full checkpoint |
 
-**为什么需要两阶段？**
-- **effectiveBalance**：每个 epoch（6.4 分钟）更新一次，精度较低，但可以快速验证
-- **currentBalance**：实时余额，精度高，但需要完整的检查点流程
+**Why two phases?**
+- **effectiveBalance**: Updated per epoch (6.4 min), lower precision but fast
+- **currentBalance**: Real-time balance, high precision but requires full checkpoint
 
 ### 2. 时间戳约束
 
 ```solidity
-// verifyWithdrawalCredentials 必须使用未来时间戳
+// verifyWithdrawalCredentials must use future timestamp
 beaconTimestamp > currentCheckpointTimestamp
 beaconTimestamp > lastCheckpointTimestamp
 
-// verifyStaleBalance 必须晚于上次更新
+// verifyStaleBalance must be later than last update
 beaconTimestamp > validatorInfo.lastCheckpointedAt
 
-// startCheckpoint 不能在同一区块完成两次
+// startCheckpoint cannot complete twice in same block
 lastCheckpointTimestamp != uint64(block.timestamp)
 ```
 
-**目的**：
-- 防止新验证者被用于已存在的检查点
-- 确保状态转换的时间顺序性
-- 避免 `lastCheckpointedAt` 冲突
+**Purpose**:
+- Prevent newly verified validators from being used in existing checkpoints
+- Ensure time-ordered state transitions
+- Avoid `lastCheckpointedAt` conflicts
 
 ### 3. Gas 优化策略
 
-#### 批量证明
+#### Batch Proofs
 ```solidity
-// ✅ 好：一次提交多个验证者
+// Good: Submit multiple validators at once
 verifyCheckpointProofs([proofA, proofB, proofC]);
 
-// ❌ 差：分开提交
+// Bad: Submit separately
 verifyCheckpointProofs([proofA]);
 verifyCheckpointProofs([proofB]);
 verifyCheckpointProofs([proofC]);
 ```
 
-#### 跳过无效验证者
+#### Skip Invalid Validators
 ```solidity
-// 使用 continue 而非 revert
+// Use continue instead of revert
 if (validatorInfo.status != VALIDATOR_STATUS.ACTIVE) {
-    continue;  // ✅ 跳过，继续处理其他验证者
+    continue;  // Skip, process others
 }
 
-// ❌ 如果使用 revert，整个交易失败，浪费 gas
+// Bad: Using revert fails entire transaction
 // revert ValidatorNotActive();
 ```
 
-#### Sub-gwei 余额处理
+#### Sub-gwei Balance Handling
 ```solidity
-// 不到 1 gwei 的余额不计入份额
+// Balances less than 1 gwei are not included in shares
 uint64 podBalanceGwei = uint64(address(this).balance / GWEI_TO_WEI);
-// 例如：1.9999999999 ETH → 1 ETH (丢失 0.9999999999 gwei)
+// Example: 1.9999999999 ETH -> 1 ETH (loses 0.9999999999 gwei)
 ```
 
-**建议**：用户可以向 Pod 充值少量 ETH，使余额凑整到 gwei
+**Recommendation**: Users can top up Pod with small amount to round to gwei
 
 ### 4. 安全机制
 
-#### 防重入
+#### Reentrancy Protection
 ```solidity
 contract EigenPod is ReentrancyGuardUpgradeable {
-    // 所有外部函数都受 ReentrancyGuard 保护
+    // All external functions protected by ReentrancyGuard
 }
 ```
 
-#### 暂停开关
+#### Pause Switches
 ```solidity
 modifier onlyWhenNotPaused(uint8 index) {
     require(!IPausable(address(eigenPodManager)).paused(index), CurrentlyPaused());
     _;
 }
 
-// 每个关键函数都有对应的暂停位
+// Each critical function has corresponding pause bit
 // PAUSED_START_CHECKPOINT = 0
 // PAUSED_EIGENPODS_VERIFY_CREDENTIALS = 1
 // PAUSED_EIGENPODS_VERIFY_CHECKPOINT_PROOFS = 2
 // PAUSED_VERIFY_STALE_BALANCE = 3
 ```
 
-#### 防重复证明
+#### Prevent Duplicate Proofs
 ```solidity
-// 通过 lastCheckpointedAt 防止同一验证者在同一检查点被重复证明
+// Prevent duplicate proofs via lastCheckpointedAt
 if (validatorInfo.lastCheckpointedAt >= checkpointTimestamp) {
     continue;
 }
 ```
 
-#### 防止状态冲突
+#### Prevent State Conflicts
 ```solidity
-// 不能在已有活跃检查点时启动新检查点
+// Cannot start new checkpoint when one is active
 require(currentCheckpointTimestamp == 0, CheckpointAlreadyActive());
 
-// 不能在同一区块完成两次检查点
+// Cannot complete two checkpoints in same block
 require(lastCheckpointTimestamp != uint64(block.timestamp),
         CannotCheckpointTwiceInSingleBlock());
 ```
 
 ### 5. 存储优化
 
-#### 使用 Gwei 而非 Wei
+#### Use Gwei Instead of Wei
 ```solidity
-// ✅ 使用 uint64 存储 gwei（节省 gas）
+// Good: Use uint64 to store gwei (saves gas)
 uint64 public restakedExecutionLayerGwei;
 
-// ❌ 如果使用 wei，需要 uint256
-// uint256 public restakedExecutionLayerWei;  // 浪费存储
+// Bad: Using wei requires uint256
+// uint256 public restakedExecutionLayerWei;  // Wastes storage
 ```
 
-**原因**：
+**Reason**:
 - 1 gwei = 10^9 wei
-- 信标链使用 gwei 为单位
-- uint64 最大值 = 18,446,744,073 gwei ≈ 18.4 billion ETH（足够）
+- Beacon chain uses gwei
+- uint64 max = 18,446,744,073 gwei ≈ 18.4 billion ETH (sufficient)
 
-#### 紧凑的时间戳
+#### Compact Timestamps
 ```solidity
-uint64 public currentCheckpointTimestamp;  // 而非 uint256
+uint64 public currentCheckpointTimestamp;  // Not uint256
 uint64 public lastCheckpointTimestamp;
 ```
 
 ### 6. 边界情况处理
 
-#### 无活跃验证者的检查点
+#### Checkpoint with No Active Validators
 ```solidity
-// 如果 activeValidatorCount == 0，检查点立即完成
+// If activeValidatorCount == 0, checkpoint completes immediately
 if (checkpoint.proofsRemaining == 0) {
-    // 自动调用 _updateCheckpoint 完成
+    // Auto-call _updateCheckpoint to complete
 }
 ```
 
-#### 罚没导致的紧急检查点
+#### Emergency Checkpoint from Slashing
 ```solidity
-// verifyStaleBalance 检测到罚没后自动启动检查点
+// verifyStaleBalance auto-starts checkpoint after detecting slashing
 function verifyStaleBalance(...) external {
     require(proof.validatorFields.isValidatorSlashed(),
             ValidatorNotSlashedOnBeaconChain());
 
-    _startCheckpoint(false);  // 自动启动
+    _startCheckpoint(false);  // Auto-start
 }
 ```
 
-#### 验证者余额为 0 的处理
+#### Handle Zero Balance Validators
 ```solidity
-// 自动标记为 WITHDRAWN
+// Auto-mark as WITHDRAWN
 if (newBalanceGwei == 0) {
     activeValidatorCount--;
     validatorInfo.status = VALIDATOR_STATUS.WITHDRAWN;
@@ -1111,50 +1088,50 @@ if (newBalanceGwei == 0) {
 
 ### Checkpoint 机制的核心价值
 
-1. **准确性**：确保 EigenLayer 份额精确反映验证者在信标链的实际余额
-2. **灵活性**：支持增量更新，无需每次都验证所有验证者
-3. **安全性**：通过 Merkle 证明确保数据来源可信，防止作弊
-4. **Gas 效率**：批量提交证明，跳过无效验证者，优化存储布局
+1. **Accuracy**: Ensures EigenLayer shares precisely reflect actual beacon chain validator balances
+2. **Flexibility**: Supports incremental updates, no need to verify all validators each time
+3. **Security**: Merkle proofs ensure trusted data source, prevent cheating
+4. **Gas Efficiency**: Batch proof submission, skip invalid validators, optimized storage layout
 
 ### 三个核心函数对比
 
-| 函数 | 触发时机 | 主要作用 | 余额来源 | 是否立即更新份额 |
-|------|---------|---------|---------|-----------------|
-| **verifyWithdrawalCredentials** | 首次注册验证者 | 激活验证者，立即增加份额 | effectiveBalance | ✅ 是 |
-| **startCheckpoint** | 定期/罚没时 | 创建余额快照，锁定 Pod 余额 | 执行层余额 | ❌ 否 |
-| **verifyCheckpointProofs** | 检查点激活后 | 更新验证者余额，完成检查点 | currentBalance | ✅ 是（完成时） |
+| Function | Trigger | Purpose | Balance Source | Immediate Share Update |
+|----------|---------|---------|----------------|----------------------|
+| **verifyWithdrawalCredentials** | First registration | Activate validator, immediate shares | effectiveBalance | ✅ Yes |
+| **startCheckpoint** | Periodic/slashing | Create balance snapshot, lock Pod balance | Execution layer | ❌ No |
+| **verifyCheckpointProofs** | After checkpoint starts | Update validator balances, complete checkpoint | currentBalance | ✅ Yes (when complete) |
 
 ### 完整工作流程
 
 ```
-1. 质押 32 ETH 到信标链
+1. Stake 32 ETH to beacon chain
    ↓
-2. verifyWithdrawalCredentials() - 首次注册，获得初始份额
+2. verifyWithdrawalCredentials() - First registration, get initial shares
    ↓
-3. 验证者工作，奖励累积（共识层 + 执行层）
+3. Validators work, rewards accumulate (consensus + execution layers)
    ↓
-4. startCheckpoint() - 启动检查点，锁定快照
+4. startCheckpoint() - Start checkpoint, lock snapshot
    ↓
-5. verifyCheckpointProofs() - 提交证明，更新余额
+5. verifyCheckpointProofs() - Submit proofs, update balances
    ↓
-6. 检查点完成，份额更新
+6. Checkpoint completes, shares updated
    ↓
-7. 用户通过 DelegationManager 发起提款
+7. User initiates withdrawal via DelegationManager
    ↓
-8. 延迟期后，ETH 从 Pod 转出
+8. After delay period, ETH transfers from Pod
 ```
 
 ### 进一步阅读
 
-- [EigenPod.md](./EigenPod.md) - EigenPod 完整文档
-- [EigenPodManager.md](./EigenPodManager.md) - EigenPodManager 文档
-- [BeaconChainProofs 库](./libraries/) - 信标链证明验证库
-- [EIP-4788](https://eips.ethereum.org/EIPS/eip-4788) - 信标链区块根预言机
-- [EIP-7002](https://eips.ethereum.org/EIPS/eip-7002) - 执行层触发的退出
-- [EIP-7251](https://eips.ethereum.org/EIPS/eip-7251) - 验证者合并请求
+- [EigenPod.md](./EigenPod.md) - Complete EigenPod documentation
+- [EigenPodManager.md](./EigenPodManager.md) - EigenPodManager documentation
+- [BeaconChainProofs library](./libraries/) - Beacon chain proof verification library
+- [EIP-4788](https://eips.ethereum.org/EIPS/eip-4788) - Beacon block root oracle
+- [EIP-7002](https://eips.ethereum.org/EIPS/eip-7002) - Execution layer triggered exits
+- [EIP-7251](https://eips.ethereum.org/EIPS/eip-7251) - Consolidation requests
 
 ---
 
-**文档版本**: v1.0.0
-**最后更新**: 2024-12-16
-**适用于**: EigenLayer v1.8.1+
+**Document Version**: v1.0.0
+**Last Updated**: 2024-12-16
+**Applicable to**: EigenLayer v1.8.1+
